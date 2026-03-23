@@ -37,11 +37,11 @@ class Config:
 
 def load_config() -> Config:
     load_dotenv()
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = "8628280617:AAEHHRQZ2dxsxoFWvmLs1PVO_wSCRn0rHPc"
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN is required.")
 
-    storage_state = Path(os.getenv("IG_STORAGE_STATE_PATH", "ig_storage_state.json")).resolve()
+    storage_state = Path(os.getenv("80454330558%3AgyVmoDRy4c8pBj%3A10%3AAYjmGCgu-Dyr9xAHamOkRAXeLgb-V9ucRcxKbKNMIQ", "ig_storage_state.json")).resolve()
     user_agent = os.getenv(
         "IG_USER_AGENT",
         (
