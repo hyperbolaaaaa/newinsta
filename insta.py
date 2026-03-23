@@ -1,260 +1,405 @@
-import asyncio
-import logging
+"""
+Username -> media Instagram Telegram bot (OG style, fixed version).
+
+Flow:
+1) User sends Instagram username/profile link.
+2) Playwright (with IG session) opens profile and collects post links.
+3) Instaloader resolves each post and extracts media URLs.
+4) Bot sends media to Telegram.
+"""
+
+import datetime
 import os
+import random
 import re
-import tempfile
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List
+import threading
+import time
+from dataclasses import dataclass, field
+from io import BytesIO
+from queue import Queue
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import instaloader
-from dotenv import load_dotenv
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import async_playwright
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import requests
+import telebot
+from PIL import Image
+from playwright.sync_api import sync_playwright
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-PROFILE_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
-POST_PATH_PARTS = ("/p/", "/reel/", "/tv/")
-MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4"}
+# =========================
+# CONFIG (ENV ONLY)
+# =========================
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+IG_SESSIONID = os.getenv("IG_SESSIONID", "").strip()
+IG_STORAGE_STATE_PATH = os.getenv("IG_STORAGE_STATE_PATH", "").strip()
+MAX_SCRAPED_POSTS = int(os.getenv("MAX_SCRAPED_POSTS", "120"))
+SEND_BATCH_SIZE = int(os.getenv("SEND_BATCH_SIZE", "10"))
+
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
+if not IG_SESSIONID and not IG_STORAGE_STATE_PATH:
+    raise RuntimeError("Set IG_SESSIONID or IG_STORAGE_STATE_PATH.")
+
+bot = telebot.TeleBot(TOKEN, threaded=True)
 
 
-@dataclass
-class Config:
-    telegram_bot_token: str
-    ig_storage_state_path: Path
-    ig_user_agent: str
-    max_posts_per_request: int
-    headless: bool
-    request_timeout_ms: int
-    instaloader_username: str
-    instaloader_password: str
-    instaloader_session_file: str
+def log(msg: str) -> None:
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
 
 
-def load_config() -> Config:
-    load_dotenv()
-    token = "8628280617:AAEHHRQZ2dxsxoFWvmLs1PVO_wSCRn0rHPc"
-    if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN is required.")
-
-    storage_state = Path(os.getenv("80454330558%3AgyVmoDRy4c8pBj%3A10%3AAYjmGCgu-Dyr9xAHamOkRAXeLgb-V9ucRcxKbKNMIQ", "ig_storage_state.json")).resolve()
-    user_agent = os.getenv(
-        "IG_USER_AGENT",
-        (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-    )
-    max_posts = int(os.getenv("MAX_POSTS_PER_REQUEST", "5"))
-    headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() in {"1", "true", "yes"}
-    timeout_ms = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "60000"))
-
-    return Config(
-        telegram_bot_token=token,
-        ig_storage_state_path=storage_state,
-        ig_user_agent=user_agent,
-        max_posts_per_request=max_posts,
-        headless=headless,
-        request_timeout_ms=timeout_ms,
-        instaloader_username=os.getenv("IG_USERNAME", "").strip(),
-        instaloader_password=os.getenv("IG_PASSWORD", "").strip(),
-        instaloader_session_file=os.getenv("IG_INSTALOADER_SESSIONFILE", "").strip(),
-    )
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 
 
-def extract_username(value: str) -> str:
-    raw = value.strip().rstrip("/")
+def extract_username(text: str) -> Optional[str]:
+    raw = (text or "").strip().split("?")[0].rstrip("/")
     if not raw:
-        return ""
-    if PROFILE_RE.fullmatch(raw):
-        return raw
+        return None
+    if USERNAME_RE.fullmatch(raw):
+        return raw.lower()
 
-    if not raw.startswith("http://") and not raw.startswith("https://"):
+    if not raw.startswith(("http://", "https://")):
         raw = f"https://{raw}"
-
     try:
         parsed = urlparse(raw)
     except Exception:
-        return ""
+        return None
 
     if "instagram.com" not in parsed.netloc.lower():
-        return ""
-
+        return None
     parts = [p for p in parsed.path.split("/") if p]
     if not parts:
-        return ""
+        return None
     username = parts[0]
-    return username if PROFILE_RE.fullmatch(username) else ""
+    return username.lower() if USERNAME_RE.fullmatch(username) else None
 
 
-async def collect_profile_post_links(config: Config, username: str) -> List[str]:
-    if not config.ig_storage_state_path.exists():
-        raise FileNotFoundError(
-            f"Missing Instagram storage state file: {config.ig_storage_state_path}. "
-            "Run create_ig_session.py first."
-        )
+# =========================
+# INSTALOADER
+# =========================
 
-    profile_url = f"https://www.instagram.com/{username}/"
-    links: List[str] = []
+L = instaloader.Instaloader(
+    download_pictures=False,
+    download_videos=False,
+    download_video_thumbnails=False,
+    save_metadata=False,
+    download_comments=False,
+)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=config.headless)
-        context = await browser.new_context(
-            storage_state=str(config.ig_storage_state_path),
-            user_agent=config.ig_user_agent,
-            viewport={"width": 1366, "height": 768},
-        )
-        page = await context.new_page()
-        page.set_default_timeout(config.request_timeout_ms)
-
-        try:
-            await page.goto(profile_url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
-            for _ in range(4):
-                hrefs = await page.eval_on_selector_all(
-                    "a[href]",
-                    "els => els.map(e => e.getAttribute('href')).filter(Boolean)",
-                )
-                for href in hrefs:
-                    if any(part in href for part in POST_PATH_PARTS):
-                        full = f"https://www.instagram.com{href.split('?')[0]}".rstrip("/")
-                        if full not in links:
-                            links.append(full)
-                            if len(links) >= config.max_posts_per_request:
-                                return links
-                await page.mouse.wheel(0, 2500)
-                await page.wait_for_timeout(1200)
-        except PlaywrightTimeoutError:
-            logging.warning("Playwright timeout while reading profile %s", username)
-        finally:
-            await context.close()
-            await browser.close()
-
-    return links
+if IG_SESSIONID:
+    L.context._session.cookies.set("sessionid", IG_SESSIONID, domain=".instagram.com")
+    log("Instaloader session cookie loaded")
 
 
-def _create_loader(config: Config, download_dir: str) -> instaloader.Instaloader:
-    loader = instaloader.Instaloader(
-        dirname_pattern=download_dir,
-        save_metadata=False,
-        compress_json=False,
-        download_comments=False,
-        download_video_thumbnails=False,
-        post_metadata_txt_pattern="",
-        storyitem_metadata_txt_pattern="",
-    )
-    if config.instaloader_session_file and config.instaloader_username:
-        try:
-            loader.load_session_from_file(config.instaloader_username, config.instaloader_session_file)
-            return loader
-        except Exception as exc:
-            logging.warning("Instaloader session file failed: %s", exc)
-
-    if config.instaloader_username and config.instaloader_password:
-        loader.login(config.instaloader_username, config.instaloader_password)
-    return loader
-
-
-def _download_post_via_instaloader(config: Config, post_link: str, download_dir: str) -> List[Path]:
-    match = re.search(r"/(p|reel|tv)/([^/?#]+)/?", post_link)
-    if not match:
-        return []
-
-    shortcode = match.group(2)
-    loader = _create_loader(config, download_dir)
-    post = instaloader.Post.from_shortcode(loader.context, shortcode)
-    target = f"post_{shortcode}"
-    loader.download_post(post, target=target)
-
-    files = []
-    for file in Path(download_dir).rglob("*"):
-        if file.is_file() and file.suffix.lower() in MEDIA_EXTS:
-            files.append(file)
-    return sorted(files)
-
-
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _ = context
-    await update.message.reply_text(
-        "Send Instagram username or profile URL.\n"
-        "Example: `natgeo` or `https://www.instagram.com/natgeo/`",
-        parse_mode="Markdown",
-    )
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    config: Config = context.application.bot_data["config"]
-    username = extract_username(update.message.text or "")
-    if not username:
-        await update.message.reply_text("Invalid input. Send a valid Instagram username or profile URL.")
-        return
-
-    await update.message.reply_text(f"Fetching recent posts from @{username} ...")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
+def get_post_from_url(post_url: str) -> Optional[instaloader.Post]:
     try:
-        post_links = await collect_profile_post_links(config, username)
-    except FileNotFoundError as exc:
-        await update.message.reply_text(str(exc))
-        return
+        m = re.search(r"(?:p|reel|tv)/([^/?#]+)", post_url)
+        if not m:
+            return None
+        shortcode = m.group(1)
+        return instaloader.Post.from_shortcode(L.context, shortcode)
     except Exception as exc:
-        logging.exception("Playwright profile scrape failed")
-        await update.message.reply_text(f"Failed while opening profile: {exc}")
-        return
+        log(f"Instaloader post load failed: {exc}")
+        return None
 
-    if not post_links:
-        await update.message.reply_text("No posts found (or profile is private/inaccessible).")
-        return
 
-    await update.message.reply_text(f"Found {len(post_links)} post link(s). Downloading and sending media...")
+def extract_media(post: instaloader.Post) -> List[Tuple[str, str]]:
+    items: List[Tuple[str, str]] = []
+    if post.typename == "GraphSidecar":
+        for node in post.get_sidecar_nodes():
+            if node.is_video and node.video_url:
+                items.append(("video", node.video_url))
+            elif node.display_url:
+                items.append(("photo", node.display_url))
+    elif post.is_video and post.video_url:
+        items.append(("video", post.video_url))
+    elif post.url:
+        items.append(("photo", post.url))
+    return items
 
-    for link in post_links:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-        with tempfile.TemporaryDirectory(prefix="ig_post_") as tmp_dir:
+
+# =========================
+# JOB MODEL
+# =========================
+
+
+@dataclass
+class Job:
+    chat_id: int
+    username: str
+    posts: List[str] = field(default_factory=list)
+    sent: int = 0
+    running: bool = True
+    ready: bool = False
+    failed: bool = False
+    fail_reason: str = ""
+
+
+jobs_by_chat: Dict[int, Job] = {}
+job_queue: "Queue[Optional[Job]]" = Queue()
+job_lock = threading.Lock()
+
+
+def set_job(chat_id: int, job: Job) -> None:
+    with job_lock:
+        jobs_by_chat[chat_id] = job
+
+
+def get_job(chat_id: int) -> Optional[Job]:
+    with job_lock:
+        return jobs_by_chat.get(chat_id)
+
+
+# =========================
+# SCRAPER
+# =========================
+
+
+def scrape_profile_posts(job: Job, context) -> None:
+    page = None
+    try:
+        page = context.new_page()
+        url = f"https://www.instagram.com/{job.username}/"
+
+        time.sleep(random.uniform(2.0, 3.5))
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_load_state("networkidle", timeout=45000)
+        time.sleep(random.uniform(1.5, 2.5))
+
+        if "challenge" in page.url:
+            raise RuntimeError("Instagram challenge page detected.")
+        if "accounts/login" in page.url:
+            raise RuntimeError("Instagram redirected to login (session expired).")
+
+        for _ in range(25):
+            if not job.running:
+                break
+
+            hrefs = page.evaluate(
+                """
+                Array.from(document.querySelectorAll('a[href]'))
+                  .map(a => a.getAttribute('href'))
+                  .filter(Boolean)
+                """
+            )
+            new_count = 0
+            for href in hrefs:
+                if "/p/" not in href and "/reel/" not in href and "/tv/" not in href:
+                    continue
+                link = f"https://www.instagram.com{href.split('?')[0]}".rstrip("/")
+                if link not in job.posts:
+                    job.posts.append(link)
+                    new_count += 1
+
+            log(f"@{job.username}: total={len(job.posts)} (+{new_count})")
+            if len(job.posts) >= MAX_SCRAPED_POSTS:
+                break
+
+            page.evaluate("window.scrollBy(0, 1400)")
+            time.sleep(random.uniform(1.5, 2.7))
+
+        if len(job.posts) == 0:
+            raise RuntimeError("No posts discovered.")
+
+        job.ready = True
+    except Exception as exc:
+        job.failed = True
+        job.fail_reason = str(exc)
+    finally:
+        if page:
             try:
-                files = await asyncio.to_thread(_download_post_via_instaloader, config, link, tmp_dir)
+                page.close()
+            except Exception:
+                pass
+
+
+def send_download_keyboard(chat_id: int, total_posts: int) -> None:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(f"Download {SEND_BATCH_SIZE} Posts", callback_data="next"),
+        InlineKeyboardButton("Cancel", callback_data="cancel"),
+    )
+    bot.send_message(chat_id, f"Collected {total_posts} posts. Press download.", reply_markup=markup)
+
+
+def playwright_worker() -> None:
+    log("Starting Playwright worker...")
+    with sync_playwright() as play:
+        browser = play.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        if IG_STORAGE_STATE_PATH and os.path.exists(IG_STORAGE_STATE_PATH):
+            context = browser.new_context(storage_state=IG_STORAGE_STATE_PATH)
+            log("Playwright context started with storage state")
+        else:
+            context = browser.new_context()
+            if IG_SESSIONID:
+                context.add_cookies(
+                    [
+                        {
+                            "name": "sessionid",
+                            "value": IG_SESSIONID,
+                            "domain": ".instagram.com",
+                            "path": "/",
+                            "httpOnly": True,
+                            "secure": True,
+                            "sameSite": "None",
+                        }
+                    ]
+                )
+                log("Playwright context started with sessionid cookie")
+
+        while True:
+            job = job_queue.get()
+            if job is None:
+                break
+            try:
+                log(f"Scraping started for @{job.username}")
+                scrape_profile_posts(job, context)
+                if job.failed:
+                    bot.send_message(job.chat_id, f"Failed to collect posts: {job.fail_reason}")
+                elif job.running:
+                    send_download_keyboard(job.chat_id, len(job.posts))
             except Exception as exc:
-                logging.warning("Download failed for %s: %s", link, exc)
-                await update.message.reply_text(f"Failed for {link}")
-                continue
+                log(f"Worker error: {exc}")
+                bot.send_message(job.chat_id, f"Scrape error: {exc}")
+            finally:
+                job_queue.task_done()
 
-            if not files:
-                await update.message.reply_text(f"No downloadable media for {link}")
-                continue
-
-            await update.message.reply_text(f"Post: {link}")
-            for file_path in files:
-                try:
-                    with file_path.open("rb") as fp:
-                        await update.message.reply_document(document=fp, filename=file_path.name)
-                except Exception as exc:
-                    logging.warning("Telegram upload failed for %s: %s", file_path, exc)
-                    await update.message.reply_text(f"Upload failed: {file_path.name}")
+        context.close()
+        browser.close()
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+# =========================
+# TELEGRAM HANDLERS
+# =========================
+
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    bot.send_message(
+        message.chat.id,
+        "Send Instagram username or profile URL.\nExample: natgeo or https://www.instagram.com/natgeo/",
     )
 
-    config = load_config()
-    app = Application.builder().token(config.telegram_bot_token).build()
-    app.bot_data["config"] = config
 
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+@bot.message_handler(func=lambda m: True)
+def profile_handler(message):
+    username = extract_username(message.text)
+    if not username:
+        bot.send_message(
+            message.chat.id,
+            "Invalid input. Send Instagram username or profile link.",
+        )
+        return
 
-    logging.info("Bot started.")
-    app.run_polling(close_loop=False)
+    old_job = get_job(message.chat.id)
+    if old_job and old_job.running and not old_job.ready:
+        bot.send_message(message.chat.id, "A scrape is already running. Please wait.")
+        return
+
+    job = Job(chat_id=message.chat.id, username=username)
+    set_job(message.chat.id, job)
+    bot.send_message(message.chat.id, f"Collecting posts from @{username} ...")
+    job_queue.put(job)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel")
+def cancel(call):
+    job = get_job(call.message.chat.id)
+    if job:
+        job.running = False
+    bot.send_message(call.message.chat.id, "Stopped.")
+
+
+def send_media(chat_id: int, media_type: str, media_url: str, post_url: str) -> None:
+    media_url = media_url.replace("&amp;", "&").replace(".heic", ".jpg")
+    response = requests.get(media_url, timeout=40, stream=True)
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code} while downloading media")
+
+    file_like = BytesIO(response.content)
+    if media_type == "video":
+        file_like.name = "video.mp4"
+        bot.send_video(chat_id, file_like, supports_streaming=True)
+    else:
+        image = Image.open(file_like).convert("RGB")
+        jpeg = BytesIO()
+        image.save(jpeg, format="JPEG")
+        jpeg.seek(0)
+        bot.send_photo(chat_id, jpeg)
+    time.sleep(random.uniform(1.0, 2.2))
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "next")
+def send_next(call):
+    job = get_job(call.message.chat.id)
+    if not job:
+        bot.send_message(call.message.chat.id, "No active job.")
+        return
+    if job.failed:
+        bot.send_message(call.message.chat.id, f"Job failed: {job.fail_reason}")
+        return
+    if not job.ready:
+        bot.send_message(call.message.chat.id, "Still collecting posts. Try again in a few seconds.")
+        return
+
+    start_idx = job.sent
+    end_idx = min(start_idx + SEND_BATCH_SIZE, len(job.posts))
+    posts = job.posts[start_idx:end_idx]
+    if not posts:
+        bot.send_message(call.message.chat.id, "No more posts to send.")
+        return
+
+    bot.send_message(call.message.chat.id, f"Downloading {len(posts)} posts...")
+
+    for post_url in posts:
+        try:
+            post = get_post_from_url(post_url)
+            if not post:
+                bot.send_message(call.message.chat.id, f"Could not load post:\n{post_url}")
+                continue
+
+            medias = extract_media(post)
+            if not medias:
+                bot.send_message(call.message.chat.id, f"No media found:\n{post_url}")
+                continue
+
+            for media_type, media_url in medias:
+                try:
+                    send_media(call.message.chat.id, media_type, media_url, post_url)
+                except Exception as exc:
+                    bot.send_message(
+                        call.message.chat.id,
+                        f"Failed media in post:\n{post_url}\nReason: {exc}",
+                    )
+        except Exception as exc:
+            bot.send_message(call.message.chat.id, f"Error processing post:\n{post_url}\nReason: {exc}")
+
+    job.sent = end_idx
+    remaining = len(job.posts) - job.sent
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(f"Next {SEND_BATCH_SIZE}", callback_data="next"),
+        InlineKeyboardButton("Cancel", callback_data="cancel"),
+    )
+    bot.send_message(
+        call.message.chat.id,
+        f"Sent: {job.sent}/{len(job.posts)} posts. Remaining: {remaining}",
+        reply_markup=markup,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    print("Bot started")
+    threading.Thread(target=playwright_worker, daemon=True).start()
+    bot.infinity_polling(skip_pending=True)
