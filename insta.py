@@ -17,7 +17,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 # =========================
 # BOT TOKEN
 # =========================
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TOKEN = "8665521420:AAHi0hfMNn3odVDCd9ajMCW_8FwrSz2OQLQ"
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN environment variable.")
 bot = telebot.TeleBot(TOKEN, threaded=True)
@@ -27,7 +27,7 @@ job_queue = Queue()
 # =========================
 # INSTAGRAM SESSION
 # =========================
-IG_SESSIONID = os.getenv("IG_SESSIONID", "")
+IG_SESSIONID = "80454330558%3A5e12tyYRkvWdAh%3A1%3AAYjeFHAV6_xhi-7RLbWt2pFrfMiilvL80sysNuRNPQ"
 if not IG_SESSIONID:
     raise RuntimeError("Set IG_SESSIONID environment variable.")
 
