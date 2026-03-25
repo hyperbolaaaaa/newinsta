@@ -33,7 +33,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 # =========================
 
 TOKEN = "8628280617:AAEHHRQZ2dxsxoFWvmLs1PVO_wSCRn0rHPc"
-IG_SESSIONID = "80454330558%3A5e12tyYRkvWdAh%3A1%3AAYju-n_Ua5LGQXkCBU-Rm-NG_gJT8c9wXM2OBAN37w"
+IG_SESSIONID = "80454330558%3A5e12tyYRkvWdAh%3A1%3AAYjeFHAV6_xhi-7RLbWt2pFrfMiilvL80sysNuRNPQ"
 IG_STORAGE_STATE_PATH = os.getenv("IG_STORAGE_STATE_PATH", "").strip()
 MAX_SCRAPED_POSTS = int(os.getenv("MAX_SCRAPED_POSTS", "120"))
 SEND_BATCH_SIZE = int(os.getenv("SEND_BATCH_SIZE", "10"))
