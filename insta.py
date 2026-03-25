@@ -18,7 +18,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 # =========================
 # BOT TOKEN / IG SESSION (ENV)
 # =========================
-IG_SESSIONID = "80454330558%3A5e12tyYRkvWdAh%3A1%3AAYjeFHAV6_xhi-7RLbWt2pFrfMiilvL80sysNuRNPQ"
+IG_SESSIONID = "80454330558%3A6xxAHoQjGqIUDT%3A27%3AAYgZk2reSBLrtyuCPKl9Dhkky7hhxhF3Dn5txcVLww"
 TOKEN = "8665521420:AAHi0hfMNn3odVDCd9ajMCW_8FwrSz2OQLQ"
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var.")
