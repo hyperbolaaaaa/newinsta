@@ -18,7 +18,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 # =========================
 # BOT TOKEN / IG SESSION (ENV)
 # =========================
-IG_SESSIONID = "80454330558%3A6xxAHoQjGqIUDT%3A27%3AAYgZk2reSBLrtyuCPKl9Dhkky7hhxhF3Dn5txcVLww"
+IG_SESSIONID = "80454330558%3A6xxAHoQjGqIUDT%3A27%3AAYgZk2reSBLrtyuCPKl9Dhkky7hhxhF3Dn5txcVLww" 
 TOKEN = "8665521420:AAHi0hfMNn3odVDCd9ajMCW_8FwrSz2OQLQ"
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var.")
@@ -41,23 +41,114 @@ L = instaloader.Instaloader(
     save_metadata=False,
 )
 L.context._session.cookies.set("sessionid", IG_SESSIONID, domain=".instagram.com")
+L.context.max_connection_attempts = 1
+
+
+def _ig_headers():
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.instagram.com/",
+        "Cookie": f"sessionid={IG_SESSIONID}",
+    }
+
+
+def _decode_ig_url(url):
+    if not url:
+        return ""
+    cleaned = url.replace("\\u0026", "&").replace("\\/", "/")
+    try:
+        cleaned = bytes(cleaned, "utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+    return cleaned
+
+
+def _extract_meta(html, attr, key):
+    m = re.search(rf'<meta[^>]*{attr}="{re.escape(key)}"[^>]*content="([^"]+)"', html, flags=re.IGNORECASE)
+    return _decode_ig_url(m.group(1).strip()) if m else ""
 
 
 def get_profile_info(username):
     try:
-        profile = instaloader.Profile.from_username(L.context, username)
+        url = f"https://www.instagram.com/{username}/"
+        response = requests.get(url, headers=_ig_headers(), timeout=25)
+        if response.status_code != 200:
+            raise RuntimeError(f"Profile page HTTP {response.status_code}")
+
+        html = response.text
+        og_title = _extract_meta(html, "property", "og:title")
+        og_desc = _extract_meta(html, "property", "og:description")
+        pfp = _extract_meta(html, "property", "og:image")
+
+        fullname = "-"
+        followers = "-"
+        following = "-"
+        posts = "-"
+        bio = "-"
+
+        t = re.search(r"^(.*?)\s*\(@", og_title or "")
+        if t:
+            fullname = t.group(1).strip() or "-"
+
+        d = re.search(
+            r"([0-9.,MKmk]+)\s+Followers,\s*([0-9.,MKmk]+)\s+Following,\s*([0-9.,MKmk]+)\s+Posts",
+            og_desc or "",
+        )
+        if d:
+            followers, following, posts = d.group(1), d.group(2), d.group(3)
+
+        b = re.search(r"on Instagram:\s*[\"“](.*?)[\"”]", og_desc or "")
+        if b and b.group(1).strip():
+            bio = b.group(1).strip()
+
         return {
-            "username": profile.username or username,
-            "fullname": profile.full_name or "-",
-            "followers": f"{profile.followers:,}",
-            "following": f"{profile.followees:,}",
-            "posts": f"{profile.mediacount:,}",
-            "bio": (profile.biography or "-").strip(),
-            "pfp": profile.profile_pic_url or "",
+            "username": username,
+            "fullname": fullname,
+            "followers": followers,
+            "following": following,
+            "posts": posts,
+            "bio": bio,
+            "pfp": pfp,
         }
     except Exception as e:
         log(f"Profile info error: {e}")
         return None
+
+
+def get_media_from_post_url(post_url):
+    response = requests.get(post_url, headers=_ig_headers(), timeout=25)
+    if response.status_code != 200:
+        raise RuntimeError(f"Post page HTTP {response.status_code}")
+
+    html = response.text
+    items = []
+    seen = set()
+
+    for raw in re.findall(r'"video_url":"([^"]+)"', html):
+        u = _decode_ig_url(raw)
+        if u and u not in seen:
+            seen.add(u)
+            items.append(("video", u))
+
+    for raw in re.findall(r'"display_url":"([^"]+)"', html):
+        u = _decode_ig_url(raw)
+        if u and u not in seen:
+            seen.add(u)
+            items.append(("photo", u))
+
+    if not items:
+        og_video = _extract_meta(html, "property", "og:video")
+        og_image = _extract_meta(html, "property", "og:image")
+        if og_video:
+            items.append(("video", og_video))
+        elif og_image:
+            items.append(("photo", og_image))
+
+    return items
 
 
 def extract_media(post):
@@ -290,12 +381,7 @@ def send_next(call):
 
     for post_url in posts:
         try:
-            post = get_post_from_url(post_url)
-            if not post:
-                bot.send_message(call.message.chat.id, f"⚠️ Could not load post\n{post_url}")
-                continue
-
-            medias = extract_media(post)
+            medias = get_media_from_post_url(post_url)
             if not medias:
                 bot.send_message(call.message.chat.id, f"⚠️ No media found\n{post_url}")
                 continue
