@@ -17,7 +17,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 # =========================
 # BOT TOKEN
 # =========================
-TOKEN = "8665521420:AAHi0hfMNn3odVDCd9ajMCW_8FwrSz2OQLQ"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN environment variable.")
 bot = telebot.TeleBot(TOKEN, threaded=True)
@@ -27,7 +27,7 @@ job_queue = Queue()
 # =========================
 # INSTAGRAM SESSION
 # =========================
-IG_SESSIONID = "80454330558%3A5e12tyYRkvWdAh%3A1%3AAYjeFHAV6_xhi-7RLbWt2pFrfMiilvL80sysNuRNPQ"
+IG_SESSIONID = os.getenv("IG_SESSIONID", "")
 if not IG_SESSIONID:
     raise RuntimeError("Set IG_SESSIONID environment variable.")
 
@@ -49,6 +49,60 @@ print("Instaloader session active")
 print("Starting browser...")
 
 
+def _extract_meta_content(html: str, attr: str, key: str) -> str:
+    pattern = rf'<meta[^>]*{attr}="{re.escape(key)}"[^>]*content="([^"]*)"'
+    m = re.search(pattern, html, flags=re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _get_profile_info_from_html(username: str):
+    url = f"https://www.instagram.com/{username}/"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    r = requests.get(url, headers=headers, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"Profile page HTTP {r.status_code}")
+
+    html = r.text
+    title = _extract_meta_content(html, "property", "og:title") or _extract_meta_content(html, "name", "title")
+    desc = _extract_meta_content(html, "property", "og:description") or _extract_meta_content(
+        html, "name", "description"
+    )
+    pfp = _extract_meta_content(html, "property", "og:image")
+
+    full_name = "-"
+    followers = "-"
+    following = "-"
+    posts = "-"
+
+    # Example: "12.3M Followers, 50 Following, 120 Posts - See Instagram photos..."
+    m = re.search(r"([0-9.,MKmk]+)\s+Followers,\s*([0-9.,MKmk]+)\s+Following,\s*([0-9.,MKmk]+)\s+Posts", desc)
+    if m:
+        followers = m.group(1)
+        following = m.group(2)
+        posts = m.group(3)
+
+    # Example title: "username (@username) • Instagram photos and videos"
+    t = re.search(r"^(.*?)\s*\(@", title)
+    if t:
+        full_name = t.group(1).strip() or "-"
+
+    return {
+        "username": username,
+        "fullname": full_name,
+        "followers": followers,
+        "following": following,
+        "posts": posts,
+        "bio": "-",
+        "pfp": pfp,
+    }
+
+
 def get_profile_info(username):
     try:
         profile = instaloader.Profile.from_username(L.context, username)
@@ -62,8 +116,12 @@ def get_profile_info(username):
             "pfp": profile.profile_pic_url or "",
         }
     except Exception as e:
-        log(f"Profile info error: {e}")
-        return None
+        log(f"Profile info via Instaloader failed: {e}")
+        try:
+            return _get_profile_info_from_html(username)
+        except Exception as e2:
+            log(f"Profile info fallback failed: {e2}")
+            return None
 
 
 def get_profile_posts(username, limit=100):
@@ -398,4 +456,3 @@ def send_next(call):
 print("Bot started")
 threading.Thread(target=playwright_worker, daemon=True).start()
 bot.infinity_polling()
-
