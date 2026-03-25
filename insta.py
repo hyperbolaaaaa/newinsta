@@ -45,6 +45,7 @@ L = instaloader.Instaloader(
 )
 
 L.context._session.cookies.set("sessionid", IG_SESSIONID, domain=".instagram.com")
+L.context.max_connection_attempts = 1
 print("Instaloader session active")
 print("Starting browser...")
 
@@ -158,6 +159,78 @@ def get_post_from_url(post_url):
     except Exception as e:
         log(f"Instaloader error: {e}")
         return None
+
+
+def _decode_ig_escaped_url(url):
+    if not url:
+        return ""
+    cleaned = url.replace("\\u0026", "&").replace("\\/", "/")
+    try:
+        cleaned = bytes(cleaned, "utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+    return cleaned
+
+
+def _extract_media_from_post_html(post_url):
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.instagram.com/",
+        "Cookie": f"sessionid={IG_SESSIONID}",
+    }
+
+    response = requests.get(post_url, headers=headers, timeout=25)
+    if response.status_code != 200:
+        raise RuntimeError(f"Post page HTTP {response.status_code}")
+
+    html = response.text
+    video_urls = re.findall(r'"video_url":"([^"]+)"', html)
+    image_urls = re.findall(r'"display_url":"([^"]+)"', html)
+
+    if not video_urls and not image_urls:
+        og_video = _extract_meta_content(html, "property", "og:video")
+        og_image = _extract_meta_content(html, "property", "og:image")
+        if og_video:
+            video_urls.append(og_video)
+        if og_image:
+            image_urls.append(og_image)
+
+    media = []
+    seen = set()
+    for raw in video_urls:
+        decoded = _decode_ig_escaped_url(raw)
+        if decoded and decoded not in seen:
+            seen.add(decoded)
+            media.append(("video", decoded))
+    for raw in image_urls:
+        decoded = _decode_ig_escaped_url(raw)
+        if decoded and decoded not in seen:
+            seen.add(decoded)
+            media.append(("photo", decoded))
+    return media
+
+
+def get_media_from_post_url(post_url):
+    try:
+        media = _extract_media_from_post_html(post_url)
+        if media:
+            return media
+    except Exception as e:
+        log(f"HTML media extraction failed: {e}")
+
+    post = get_post_from_url(post_url)
+    if post is not None:
+        try:
+            media = extract_media(post)
+            if media:
+                return media
+        except Exception as e:
+            log(f"Instaloader media extraction failed: {e}")
+    return []
 
 
 class Job:
@@ -323,12 +396,12 @@ def profile_handler(message):
         return
 
     caption = (
-        f"👤 Username: {info['username']}\n"
-        f"📛 Name: {info['fullname']}\n\n"
-        f"📊 Followers: {info['followers']}\n"
-        f"📊 Following: {info['following']}\n"
-        f"📸 Total Posts: {info['posts']}\n\n"
-        f"📝 Bio:\n{(info['bio'] or '-')[:500]}"
+        f"ðŸ‘¤ Username: {info['username']}\n"
+        f"ðŸ“› Name: {info['fullname']}\n\n"
+        f"ðŸ“Š Followers: {info['followers']}\n"
+        f"ðŸ“Š Following: {info['following']}\n"
+        f"ðŸ“¸ Total Posts: {info['posts']}\n\n"
+        f"ðŸ“ Bio:\n{(info['bio'] or '-')[:500]}"
     )
 
     try:
@@ -389,14 +462,9 @@ def send_next(call):
     for post_url in posts:
         try:
             log(f"Processing: {post_url}")
-            post = get_post_from_url(post_url)
-            if not post:
-                bot.send_message(call.message.chat.id, f"⚠️ Could not load post\n{post_url}")
-                continue
-
-            medias = extract_media(post)
+            medias = get_media_from_post_url(post_url)
             if not medias:
-                bot.send_message(call.message.chat.id, f"⚠️ No media found\n{post_url}")
+                bot.send_message(call.message.chat.id, f"No media found\n{post_url}")
                 continue
 
             for media_type, media_url in medias:
@@ -456,3 +524,4 @@ def send_next(call):
 print("Bot started")
 threading.Thread(target=playwright_worker, daemon=True).start()
 bot.infinity_polling()
+
