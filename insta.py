@@ -28,13 +28,29 @@ job_queue = Queue()
 IG_SESSIONID = "80454330558%3A5e12tyYRkvWdAh%3A1%3AAYjeFHAV6_xhi-7RLbWt2pFrfMiilvL80sysNuRNPQ"
 
 # =========================
-# JOB SYSTEM
+# PROFILE INFO FUNTION
+def get_profile_info(username):
+    try:
+        profile = instaloader.Profile.from_username(L.context, username)
 
+        data = {
+            "username": profile.username,
+            "fullname": profile.full_name,
+            "followers": profile.followers,
+            "following": profile.followees,
+            "posts": profile.mediacount,
+            "bio": profile.biography,
+            "pfp": profile.profile_pic_url
+        }
+
+        return data
+
+    except Exception as e:
+        log(f"Profile info error: {e}")
+        return None
 # =========================
 # LOG FUNCTION
 # =========================
-
-
 
 def log(msg):
     t = datetime.datetime.now().strftime("%H:%M:%S")
@@ -150,6 +166,9 @@ def scrape_background(job, context):
         time.sleep(5)
 
         log(f"Current URL: {page.url}")
+        log(f"page title : {page.title}")
+        bot.send_message(job.chat_id,f"🌐 Page Title:\n{page.title}")
+        bot.send_message(job.chat_id,f"🔗 Current URL:\n{page.url}")
         if "challenge" in page.url:
             log("Instagram triggered a security challenge. Session is blocked.")
             page.close()
@@ -293,8 +312,9 @@ def start(message):
         "Send Instagram username"
     )
 class Job:
-    def __init__(self, username):
+    def __init__(self, username,chat_id):
         self.username = username
+        self.chat_id = chat_id
         self.posts = []
         self.sent = 0
         self.running = True
@@ -316,6 +336,35 @@ def profile_handler(message):
             "❌ Invalid input.\n\nSend:\n• Instagram username\n• Instagram profile link"
         )
         return
+
+    # get profile info first
+    info = get_profile_info(username)
+
+    if not info:
+        bot.send_message(message.chat.id, "❌ Could not load Instagram profile.")
+        return
+
+    caption = f"""
+    👤 Username: {info['username']}
+    📛 Name: {info['fullname']}
+
+    📊 Followers: {info['followers']}
+    📊 Following: {info['following']}
+    📸 Total Posts: {info['posts']}
+
+    📝 Bio:
+    {info['bio']}
+    """
+
+    # send profile picture
+    try:
+        bot.send_photo(
+            message.chat.id,
+            info["pfp"],
+            caption=caption
+        )
+    except:
+        bot.send_message(message.chat.id, caption)
 
     job = Job(username)
     user_jobs[message.chat.id] = job
@@ -426,7 +475,17 @@ def send_next(call):
 
                     log(f"Final media URL: {media_url}")
 
-                    response = requests.get(media_url, timeout=30, stream=True)
+                    headers = {
+                        "User-Agent": "Mozilla/5.0",
+                        "Referer": "https://www.instagram.com/"
+                    }
+
+                    response = requests.get(
+                        media_url,
+                        headers=headers,
+                        timeout=30,
+                        stream=True
+                    )
 
                     if response.status_code != 200:
                         raise Exception(f"Media download failed (HTTP {response.status_code})")
