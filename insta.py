@@ -63,25 +63,7 @@ print("Instaloader session active")
 # =========================
 # START PLAYWRIGHT
 # =========================
-def get_profile_info(username):
-    try:
-        profile = instaloader.Profile.from_username(L.context, username)
 
-        data = {
-            "username": profile.username,
-            "full_name": profile.full_name,
-            "followers": profile.followers,
-            "following": profile.followees,
-            "posts": profile.mediacount,
-            "bio": profile.biography,
-            "profile_pic": profile.profile_pic_url
-        }
-
-        return data
-
-    except Exception as e:
-        log(f"Profile fetch error: {e}")
-        return None
 print("Starting browser...")
 
 def get_profile_posts(username, limit=100):
@@ -326,7 +308,6 @@ job_queue = Queue()
 def profile_handler(message):
 
     username = extract_username(message.text)
-    
 
     if not username:
 
@@ -335,27 +316,7 @@ def profile_handler(message):
             "❌ Invalid input.\n\nSend:\n• Instagram username\n• Instagram profile link"
         )
         return
-    profile = get_profile_info(username)
 
-    if not profile:
-        bot.send_message(message.chat.id, "❌ Failed to fetch profile info")
-        return
-    caption = f"""
-👤 Username: {profile['username']}
-📛 Name: {profile['full_name']}
-👥 Followers: {profile['followers']}
-➡️ Following: {profile['following']}
-📸 Posts: {profile['posts']}
-
-📝 Bio:
-{profile['bio']}
-"""
-
-    try:
-        response = requests.get(profile['profile_pic'])
-        bot.send_photo(message.chat.id, response.content, caption=caption)
-    except:
-        bot.send_message(message.chat.id, caption)
     job = Job(username)
     user_jobs[message.chat.id] = job
 
