@@ -8,6 +8,7 @@ import time
 from io import BytesIO
 from queue import Queue
 
+import instaloader
 import requests
 import telebot
 from PIL import Image
@@ -22,6 +23,10 @@ if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var.")
 
 COOKIE_DIR = os.path.join(os.getcwd(), "instacookie")
+HEADLESS = os.getenv("PW_HEADLESS", "0").strip() == "1"
+POST_BATCH = 10
+MAX_SCROLL_ROUNDS = 28
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -44,11 +49,23 @@ requests_session.headers.update(
 
 request_lock = threading.Lock()
 last_request_ts = 0.0
+instaloader_lock = threading.Lock()
 
 
+# =========================
+# LOGGING / HELPERS
+# =========================
 def log(msg):
     t = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{t}] {msg}")
+
+
+def short_url(url, limit=120):
+    if not url:
+        return "-"
+    if len(url) <= limit:
+        return url
+    return url[:limit] + "...(truncated)"
 
 
 def human_pause(min_s=1.0, max_s=3.0, extra_chance=0.18):
@@ -62,30 +79,45 @@ def throttled_get(url, timeout=35, stream=False):
     global last_request_ts
     with request_lock:
         now = time.time()
-        min_gap = random.uniform(2.2, 5.8)
+        min_gap = random.uniform(2.0, 5.5)
         elapsed = now - last_request_ts
         if elapsed < min_gap:
             time.sleep(min_gap - elapsed)
         if random.random() < 0.12:
-            time.sleep(random.uniform(2.0, 6.0))
+            time.sleep(random.uniform(1.5, 4.0))
         resp = requests_session.get(url, timeout=timeout, stream=stream)
         last_request_ts = time.time()
     return resp
 
 
-def _domain_or_default(domain):
-    domain = (domain or "").strip()
-    return domain if domain else ".instagram.com"
+def extract_username(text):
+    text = (text or "").strip().split("?")[0]
+    match = re.search(r"instagram\.com/([^/]+)/?", text)
+    if match:
+        return match.group(1).lower()
+    if re.match(r"^[a-zA-Z0-9._]+$", text):
+        return text.lower()
+    return None
 
 
+def get_shortcode_from_url(post_url):
+    m = re.search(r"/(?:p|reel|tv)/([^/?#]+)/?", post_url)
+    if not m:
+        return None
+    return m.group(1)
+
+
+# =========================
+# COOKIE LOADING
+# =========================
 def _normalize_cookie(cookie):
     name = str(cookie.get("name", "")).strip()
     value = str(cookie.get("value", "")).strip()
     if not name or not value:
         return None
 
-    domain = _domain_or_default(cookie.get("domain"))
-    path = cookie.get("path") or "/"
+    domain = str(cookie.get("domain") or ".instagram.com").strip() or ".instagram.com"
+    path = str(cookie.get("path") or "/")
     secure = bool(cookie.get("secure", True))
     http_only = bool(cookie.get("httpOnly", False))
     same_site = str(cookie.get("sameSite", "Lax"))
@@ -104,10 +136,10 @@ def _normalize_cookie(cookie):
     }
 
 
-def _parse_cookie_lines(content):
+def _parse_text_cookies(content):
     cookies = []
 
-    # Netscape format support
+    # Netscape format
     for line in content.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -115,7 +147,7 @@ def _parse_cookie_lines(content):
         parts = line.split("\t")
         if len(parts) == 7:
             domain, _flag, path, secure, _expiry, name, value = parts
-            parsed = _normalize_cookie(
+            c = _normalize_cookie(
                 {
                     "name": name,
                     "value": value,
@@ -126,24 +158,23 @@ def _parse_cookie_lines(content):
                     "sameSite": "Lax",
                 }
             )
-            if parsed:
-                cookies.append(parsed)
+            if c:
+                cookies.append(c)
 
     if cookies:
         return cookies
 
-    # Cookie header or key=value lines
-    chunks = []
-    if ";" in content and "=" in content:
-        chunks = [p.strip() for p in content.replace("\n", ";").split(";") if p.strip()]
+    # key=value style
+    if ";" in content:
+        parts = [p.strip() for p in content.replace("\n", ";").split(";") if p.strip()]
     else:
-        chunks = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        parts = [p.strip() for p in content.splitlines() if p.strip()]
 
-    for part in chunks:
+    for part in parts:
         if "=" not in part:
             continue
         name, value = part.split("=", 1)
-        parsed = _normalize_cookie(
+        c = _normalize_cookie(
             {
                 "name": name.strip(),
                 "value": value.strip(),
@@ -154,8 +185,8 @@ def _parse_cookie_lines(content):
                 "sameSite": "Lax",
             }
         )
-        if parsed:
-            cookies.append(parsed)
+        if c:
+            cookies.append(c)
 
     return cookies
 
@@ -176,7 +207,7 @@ def load_instagram_cookies(cookie_dir):
         )
 
     cookie_file = max(files, key=os.path.getmtime)
-    log(f"Loading cookies from: {cookie_file}")
+    log(f"[COOKIE] Loading from: {cookie_file}")
 
     with open(cookie_file, "r", encoding="utf-8", errors="ignore") as f:
         raw = f.read().strip()
@@ -188,32 +219,28 @@ def load_instagram_cookies(cookie_dir):
             data = data["cookies"]
 
         if isinstance(data, list):
-            for entry in data:
-                if isinstance(entry, dict):
-                    c = _normalize_cookie(entry)
+            for item in data:
+                if isinstance(item, dict):
+                    c = _normalize_cookie(item)
                     if c:
                         cookies.append(c)
         elif isinstance(data, dict):
-            # support simple dict like {"sessionid":"..."}
-            for name, value in data.items():
+            for k, v in data.items():
                 c = _normalize_cookie(
                     {
-                        "name": str(name),
-                        "value": str(value),
+                        "name": str(k),
+                        "value": str(v),
                         "domain": ".instagram.com",
                         "path": "/",
                         "secure": True,
-                        "httpOnly": False,
-                        "sameSite": "Lax",
                     }
                 )
                 if c:
                     cookies.append(c)
     except Exception:
-        cookies = _parse_cookie_lines(raw)
+        cookies = _parse_text_cookies(raw)
 
-    # keep only instagram cookies and de-duplicate by (name, domain, path)
-    filtered = []
+    out = []
     seen = set()
     for c in cookies:
         domain = c["domain"].lower()
@@ -223,15 +250,15 @@ def load_instagram_cookies(cookie_dir):
         if key in seen:
             continue
         seen.add(key)
-        filtered.append(c)
+        out.append(c)
 
-    if not filtered:
-        raise RuntimeError("No valid Instagram cookies found in cookie file.")
+    if not out:
+        raise RuntimeError("No valid Instagram cookies found.")
+    if not any(c["name"] == "sessionid" for c in out):
+        raise RuntimeError("Cookie file missing sessionid.")
 
-    if not any(c["name"] == "sessionid" for c in filtered):
-        raise RuntimeError("Cookie file is missing sessionid.")
-
-    return filtered
+    log(f"[COOKIE] Loaded {len(out)} Instagram cookies")
+    return out
 
 
 def apply_cookies_to_requests(cookies):
@@ -239,115 +266,54 @@ def apply_cookies_to_requests(cookies):
         requests_session.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"])
 
 
-def decode_ig_url(url):
-    if not url:
-        return ""
-    cleaned = url.replace("\\u0026", "&").replace("\\/", "/")
-    try:
-        cleaned = bytes(cleaned, "utf-8").decode("unicode_escape")
-    except Exception:
-        pass
-    return cleaned
+def apply_cookies_to_instaloader(loader, cookies):
+    # Ensure instaloader and requests share the same session auth
+    for c in cookies:
+        loader.context._session.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"])
+
+    loader.context.max_connection_attempts = 1
+    loader.context.request_timeout = 30.0
 
 
-def extract_meta(html, attr, key):
-    m = re.search(
-        rf'<meta[^>]*{attr}="{re.escape(key)}"[^>]*content="([^"]+)"',
-        html,
-        flags=re.IGNORECASE,
-    )
-    return decode_ig_url(m.group(1).strip()) if m else ""
+# =========================
+# INSTALOADER MEDIA
+# =========================
+def get_media_from_post_url_with_instaloader(loader, post_url):
+    shortcode = get_shortcode_from_url(post_url)
+    if not shortcode:
+        raise RuntimeError("Invalid post URL (no shortcode).")
 
+    with instaloader_lock:
+        log(f"[IL] Loading shortcode: {shortcode}")
+        post = instaloader.Post.from_shortcode(loader.context, shortcode)
 
-def get_profile_info(username):
-    try:
-        url = f"https://www.instagram.com/{username}/"
-        response = throttled_get(url, timeout=30)
-        if response.status_code != 200:
-            raise RuntimeError(f"Profile page HTTP {response.status_code}")
-
-        html = response.text
-        og_title = extract_meta(html, "property", "og:title")
-        og_desc = extract_meta(html, "property", "og:description")
-        pfp = extract_meta(html, "property", "og:image")
-
-        fullname = "-"
-        followers = "-"
-        following = "-"
-        posts = "-"
-        bio = "-"
-
-        t = re.search(r"^(.*?)\s*\(@", og_title or "")
-        if t:
-            fullname = t.group(1).strip() or "-"
-
-        d = re.search(
-            r"([0-9.,MKmk]+)\s+Followers,\s*([0-9.,MKmk]+)\s+Following,\s*([0-9.,MKmk]+)\s+Posts",
-            og_desc or "",
-        )
-        if d:
-            followers, following, posts = d.group(1), d.group(2), d.group(3)
-
-        b = re.search(r"on Instagram:\s*[\"“](.*?)[\"”]", og_desc or "")
-        if b and b.group(1).strip():
-            bio = b.group(1).strip()
-
-        return {
-            "username": username,
-            "fullname": fullname,
-            "followers": followers,
-            "following": following,
-            "posts": posts,
-            "bio": bio,
-            "pfp": pfp,
-        }
-    except Exception as e:
-        log(f"Profile info error: {e}")
-        return None
-
-
-def get_media_from_post_url(post_url):
-    response = throttled_get(post_url, timeout=35)
-    if response.status_code != 200:
-        raise RuntimeError(f"Post page HTTP {response.status_code}")
-
-    html = response.text
     items = []
-    seen = set()
 
-    for raw in re.findall(r'"video_url":"([^"]+)"', html):
-        u = decode_ig_url(raw)
-        if u and u not in seen:
-            seen.add(u)
-            items.append(("video", u))
+    if post.typename == "GraphSidecar":
+        for node in post.get_sidecar_nodes():
+            if node.is_video:
+                if node.video_url:
+                    items.append(("video", node.video_url))
+            else:
+                if node.display_url:
+                    items.append(("photo", node.display_url))
+    elif post.is_video:
+        if post.video_url:
+            items.append(("video", post.video_url))
+    else:
+        if post.url:
+            items.append(("photo", post.url))
 
-    for raw in re.findall(r'"display_url":"([^"]+)"', html):
-        u = decode_ig_url(raw)
-        if u and u not in seen:
-            seen.add(u)
-            items.append(("photo", u))
-
-    if not items:
-        og_video = extract_meta(html, "property", "og:video")
-        og_image = extract_meta(html, "property", "og:image")
-        if og_video:
-            items.append(("video", og_video))
-        elif og_image:
-            items.append(("photo", og_image))
+    photos = sum(1 for t, _ in items if t == "photo")
+    videos = sum(1 for t, _ in items if t == "video")
+    log(f"[IL] Extracted from {shortcode}: total={len(items)} photos={photos} videos={videos}")
 
     return items
 
 
-def extract_username(text):
-    text = (text or "").strip().split("?")[0]
-    match = re.search(r"instagram\.com/([^/]+)/?", text)
-    if match:
-        return match.group(1).lower()
-    if re.match(r"^[a-zA-Z0-9._]+$", text):
-        return text.lower()
-    return None
-
-
+# =========================
+# PLAYWRIGHT SCRAPER
+# =========================
 def collect_post_links(page):
     return page.evaluate(
         """
@@ -362,19 +328,18 @@ def collect_post_links(page):
 def human_scroll_and_collect(page, job):
     seen = set(job.posts)
     idle_rounds = 0
-    rounds = random.randint(16, 30)
+    rounds = random.randint(16, MAX_SCROLL_ROUNDS)
 
-    for _ in range(rounds):
+    for i in range(rounds):
         if not job.running:
             break
 
-        # random scrolling pattern: mostly down, sometimes slight up
         if random.random() < 0.2:
-            step = -random.randint(120, 420)
+            step = -random.randint(100, 350)
         else:
-            step = random.randint(350, 1450)
+            step = random.randint(450, 1550)
 
-        smooth = "smooth" if random.random() < 0.65 else "auto"
+        smooth = "smooth" if random.random() < 0.7 else "auto"
         page.evaluate(
             """
             ([distance, behavior]) => {
@@ -384,10 +349,11 @@ def human_scroll_and_collect(page, job):
             [step, smooth],
         )
 
-        human_pause(0.9, 3.4, extra_chance=0.25)
+        human_pause(1.0, 3.8, extra_chance=0.23)
 
         links = collect_post_links(page)
-        log(f"Links found: {len(links)}")
+        log(f"[PW] Round {i+1}/{rounds} links found: {len(links)}")
+
         added = 0
         for link in links:
             if link not in seen:
@@ -395,7 +361,7 @@ def human_scroll_and_collect(page, job):
                 job.posts.append(link)
                 added += 1
 
-        log(f"Collected posts: {len(job.posts)} (+{added})")
+        log(f"[PW] Collected posts: {len(job.posts)} (+{added})")
 
         if added == 0:
             idle_rounds += 1
@@ -406,35 +372,43 @@ def human_scroll_and_collect(page, job):
             break
 
 
-def scrape_background(job, context):
+def scrape_profile_links(job, context):
     username = job.username
-    log(f"Scraping started for {username}")
     page = None
+
     try:
+        log(f"[PW] Scrape started for @{username}")
         page = context.new_page()
 
-        human_pause(2.0, 5.0)
+        human_pause(2.0, 4.8)
         page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded")
         human_pause(6.0, 10.0)
 
-        log(f"Current URL: {page.url}")
-        if "challenge" in page.url:
-            log("Instagram triggered a security challenge. Session is blocked.")
-            return
+        log(f"[PW] Current URL: {page.url}")
+
         if "accounts/login" in page.url:
-            log("Session expired. Instagram requires login.")
+            job.error = "Instagram redirected to login. Cookie/session is not valid in browser."
+            return
+
+        if "challenge" in page.url:
+            job.error = "Instagram challenge page detected. Account/IP blocked temporarily."
             return
 
         page.wait_for_load_state("networkidle")
-        page.mouse.wheel(0, 1500)
+        page.mouse.move(random.randint(80, 220), random.randint(100, 260))
+        page.click("body")
+        page.mouse.wheel(0, 1400)
         time.sleep(3)
-        human_pause(1.2, 2.7)
 
         human_scroll_and_collect(page, job)
 
+        if not job.posts:
+            job.error = "No post links collected. Possibly blocked, private profile, or page not fully rendered."
+
     except Exception as e:
-        log(f"Scraper error: {e}")
+        job.error = f"Playwright scrape error: {type(e).__name__}: {e}"
     finally:
+        job.ready_event.set()
         try:
             if page:
                 page.close()
@@ -445,7 +419,7 @@ def scrape_background(job, context):
 def playwright_worker(playwright_cookies):
     with sync_playwright() as play:
         browser = play.chromium.launch(
-            headless=True,
+            headless=HEADLESS,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
@@ -457,48 +431,55 @@ def playwright_worker(playwright_cookies):
 
         context = browser.new_context(
             user_agent=USER_AGENT,
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
             viewport={
                 "width": random.randint(1220, 1380),
                 "height": random.randint(780, 950),
             },
-            locale="en-US",
-            timezone_id="Asia/Kolkata",
         )
 
         context.add_cookies(playwright_cookies)
-        print("Cookies loaded into browser:", len(playwright_cookies))
+        log(f"[PW] Cookies loaded into browser: {len(playwright_cookies)}")
 
-        page = context.new_page()
-        page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
-        page.mouse.move(100, 200)
-        page.click("body")
-        human_pause(2.5, 5.5)
-        page.close()
-        log("Instagram session activated")
+        warm = context.new_page()
+        warm.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+        human_pause(2.0, 4.0)
+        log(f"[PW] Warmup URL: {warm.url}")
+        warm.close()
 
         while True:
             job = job_queue.get()
             if job is None:
                 break
             try:
-                scrape_background(job, context)
+                scrape_profile_links(job, context)
             except Exception as e:
-                log(f"Worker error: {e}")
+                job.error = f"Worker error: {type(e).__name__}: {e}"
+                job.ready_event.set()
             finally:
                 job_queue.task_done()
 
 
+# =========================
+# JOB MODEL
+# =========================
 class Job:
     def __init__(self, username):
         self.username = username
         self.posts = []
         self.sent = 0
         self.running = True
+        self.error = None
+        self.ready_event = threading.Event()
 
 
+# =========================
+# TELEGRAM BOT HANDLERS
+# =========================
 @bot.message_handler(commands=["start"])
 def start(message):
-    bot.send_message(message.chat.id, "Send Instagram username")
+    bot.send_message(message.chat.id, "Send Instagram username or profile link")
 
 
 @bot.message_handler(func=lambda m: True)
@@ -507,58 +488,49 @@ def profile_handler(message):
     if not username:
         bot.send_message(
             message.chat.id,
-            "? Invalid input.\n\nSend:\n• Instagram username\n• Instagram profile link",
+            "Invalid input. Send Instagram username or profile link.",
         )
         return
-
-    info = get_profile_info(username)
-    if not info:
-        bot.send_message(message.chat.id, "? Could not load Instagram profile.")
-        return
-
-    caption = (
-        f"?? Username: {info['username']}\n"
-        f"?? Name: {info['fullname']}\n\n"
-        f"?? Followers: {info['followers']}\n"
-        f"?? Following: {info['following']}\n"
-        f"?? Total Posts: {info['posts']}\n\n"
-        f"?? Bio:\n{info['bio']}"
-    )
-
-    try:
-        if info["pfp"]:
-            bot.send_photo(message.chat.id, info["pfp"], caption=caption[:1024])
-        else:
-            bot.send_message(message.chat.id, caption)
-    except Exception:
-        bot.send_message(message.chat.id, caption)
 
     job = Job(username)
     user_jobs[message.chat.id] = job
 
-    bot.send_message(message.chat.id, "Collecting posts from profile....\nPlease wait...")
+    bot.send_message(
+        message.chat.id,
+        f"Collecting post links for @{username}... Please wait...",
+    )
+
     job_queue.put(job)
 
-    wait_time = 0
-    while len(job.posts) == 0 and wait_time < 50:
-        time.sleep(2)
-        wait_time += 2
-
-    if len(job.posts) == 0:
+    # Wait for first scraping pass
+    completed = job.ready_event.wait(timeout=70)
+    if not completed:
         bot.send_message(
             message.chat.id,
-            "? Failed to collect posts.\nInstagram may have blocked the request.",
+            "Scraper timeout. Instagram is slow/blocked. Try again in a few minutes.",
+        )
+        return
+
+    if job.error:
+        bot.send_message(message.chat.id, f"Scrape failed: {job.error}")
+        return
+
+    if not job.posts:
+        bot.send_message(
+            message.chat.id,
+            "No posts found. Profile may be private or Instagram blocked access.",
         )
         return
 
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("Download 10 Posts", callback_data="next"),
+        InlineKeyboardButton(f"Download {POST_BATCH} Posts", callback_data="next"),
         InlineKeyboardButton("Cancel", callback_data="cancel"),
     )
+
     bot.send_message(
         message.chat.id,
-        f"? {len(job.posts)} posts ready.\nPress download.",
+        f"Ready. Collected {len(job.posts)} post links for @{username}.",
         reply_markup=markup,
     )
 
@@ -568,104 +540,140 @@ def cancel(call):
     job = user_jobs.get(call.message.chat.id)
     if job:
         job.running = False
-    bot.send_message(call.message.chat.id, "Scraping stopped.")
+    bot.send_message(call.message.chat.id, "Stopped.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "next")
 def send_next(call):
     job = user_jobs.get(call.message.chat.id)
     if not job:
-        bot.send_message(call.message.chat.id, "No active job")
+        bot.send_message(call.message.chat.id, "No active job.")
+        return
+
+    if not job.running:
+        bot.send_message(call.message.chat.id, "Job already stopped.")
         return
 
     start_idx = job.sent
-    end_idx = start_idx + 10
-    posts = job.posts[start_idx:end_idx]
+    end_idx = start_idx + POST_BATCH
+    batch = job.posts[start_idx:end_idx]
 
-    if not posts:
-        bot.send_message(call.message.chat.id, "No more collected posts yet.")
+    if not batch:
+        bot.send_message(call.message.chat.id, "No more collected posts.")
         return
 
-    bot.send_message(call.message.chat.id, "Downloading media...")
+    bot.send_message(call.message.chat.id, f"Downloading media for posts {start_idx + 1}-{min(end_idx, len(job.posts))}...")
+    log(f"[SEND] Chat {call.message.chat.id} processing posts {start_idx}..{end_idx - 1}")
 
-    for post_url in posts:
+    for post_url in batch:
         if not job.running:
             break
 
         try:
-            medias = get_media_from_post_url(post_url)
+            log(f"[SEND] Processing {short_url(post_url)}")
+            medias = get_media_from_post_url_with_instaloader(LOADER, post_url)
             if not medias:
-                bot.send_message(call.message.chat.id, f"?? No media found\n{post_url}")
+                log(f"[SEND] No media extracted for {short_url(post_url)}")
+                bot.send_message(call.message.chat.id, f"No media found:\n{post_url}")
                 continue
 
             for media_type, media_url in medias:
+                if not job.running:
+                    break
                 try:
-                    if not media_url:
-                        bot.send_message(call.message.chat.id, f"?? Empty media URL\n{post_url}")
-                        continue
-
-                    media_url = media_url.replace("&amp;", "&").replace(".heic", ".jpg")
+                    log(f"[SEND] Downloading {media_type}: {short_url(media_url)}")
                     response = throttled_get(media_url, timeout=45, stream=True)
-                    if response.status_code != 200:
-                        raise RuntimeError(f"Media download failed (HTTP {response.status_code})")
+                    ct = response.headers.get("Content-Type", "-")
+                    cl = response.headers.get("Content-Length", "-")
+                    log(f"[SEND] Media HTTP {response.status_code}, type={ct}, len={cl}")
 
-                    file = BytesIO(response.content)
+                    if response.status_code != 200:
+                        raise RuntimeError(f"Media HTTP {response.status_code}")
+
+                    payload = response.content
+                    if not payload:
+                        raise RuntimeError("Empty media payload")
+
+                    data = BytesIO(payload)
 
                     if media_type == "video":
-                        file.name = "video.mp4"
+                        data.name = "video.mp4"
                         bot.send_video(
                             call.message.chat.id,
-                            file,
+                            data,
                             width=720,
                             height=1280,
                             supports_streaming=True,
                         )
+                        log(f"[SEND] Video sent for {short_url(post_url)}")
                     else:
-                        img = Image.open(file).convert("RGB")
-                        jpeg = BytesIO()
-                        img.save(jpeg, format="JPEG", quality=92)
-                        jpeg.seek(0)
-                        bot.send_photo(call.message.chat.id, jpeg)
+                        img = Image.open(data).convert("RGB")
+                        out = BytesIO()
+                        img.save(out, format="JPEG", quality=92)
+                        out.seek(0)
+                        bot.send_photo(call.message.chat.id, out)
+                        log(f"[SEND] Photo sent for {short_url(post_url)}")
 
-                    human_pause(1.8, 4.2, extra_chance=0.2)
+                    human_pause(1.7, 4.0, extra_chance=0.2)
 
                 except Exception as e:
+                    log(
+                        f"[SEND][ERROR] media_type={media_type} post={short_url(post_url)} "
+                        f"err={type(e).__name__}: {e}"
+                    )
                     bot.send_message(
                         call.message.chat.id,
-                        f"? Failed to send media\n\nPost:\n{post_url}\n\nReason:\n{e}",
+                        f"Failed media send:\n{post_url}\nReason: {e}",
                     )
-                    human_pause(1.2, 2.4, extra_chance=0.0)
+                    human_pause(1.0, 2.0, extra_chance=0.0)
 
-            human_pause(1.5, 3.5, extra_chance=0.2)
+            human_pause(1.2, 2.8, extra_chance=0.12)
 
         except Exception as e:
+            log(f"[SEND][ERROR] post={short_url(post_url)} err={type(e).__name__}: {e}")
             bot.send_message(
                 call.message.chat.id,
-                f"?? Error processing post\n\nPost:\n{post_url}\n\nReason:\n{e}",
+                f"Post failed:\n{post_url}\nReason: {e}",
             )
-            human_pause(1.5, 3.0, extra_chance=0.15)
 
-    job.sent += len(posts)
+    job.sent += len(batch)
 
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("Next 10", callback_data="next"),
+        InlineKeyboardButton(f"Next {POST_BATCH}", callback_data="next"),
         InlineKeyboardButton("Cancel", callback_data="cancel"),
     )
-    bot.send_message(call.message.chat.id, f"Sent {job.sent} posts", reply_markup=markup)
+
+    bot.send_message(
+        call.message.chat.id,
+        f"Done. Sent up to {job.sent} collected posts.",
+        reply_markup=markup,
+    )
+
+
+# =========================
+# STARTUP
+# =========================
+LOADER = instaloader.Instaloader(
+    download_pictures=False,
+    download_videos=False,
+    download_video_thumbnails=False,
+    save_metadata=False,
+    compress_json=False,
+)
 
 
 def main():
     cookies = load_instagram_cookies(COOKIE_DIR)
     apply_cookies_to_requests(cookies)
+    apply_cookies_to_instaloader(LOADER, cookies)
 
     log("Bot started")
+    log(f"Playwright headless mode: {HEADLESS}")
 
     threading.Thread(target=playwright_worker, args=(cookies,), daemon=True).start()
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 
 if __name__ == "__main__":
     main()
-
-
