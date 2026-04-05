@@ -23,7 +23,7 @@ if not TOKEN:
     raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var.")
 
 COOKIE_DIR = os.path.join(os.getcwd(), "instacookie")
-HEADLESS = os.getenv("PW_HEADLESS", "0").strip() == "1"
+HEADLESS = True
 POST_BATCH = 10
 MAX_SCROLL_ROUNDS = 28
 
