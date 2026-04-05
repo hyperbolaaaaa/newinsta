@@ -288,7 +288,7 @@ def get_profile_info(username):
         if d:
             followers, following, posts = d.group(1), d.group(2), d.group(3)
 
-        b = re.search(r"on Instagram:\s*[\"�](.*?)[\"�]", og_desc or "")
+        b = re.search(r"on Instagram:\s*[\"“](.*?)[\"”]", og_desc or "")
         if b and b.group(1).strip():
             bio = b.group(1).strip()
 
@@ -387,6 +387,7 @@ def human_scroll_and_collect(page, job):
         human_pause(0.9, 3.4, extra_chance=0.25)
 
         links = collect_post_links(page)
+        log(f"Links found: {len(links)}")
         added = 0
         for link in links:
             if link not in seen:
@@ -414,7 +415,7 @@ def scrape_background(job, context):
 
         human_pause(2.0, 5.0)
         page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded")
-        human_pause(3.0, 6.5)
+        human_pause(6.0, 10.0)
 
         log(f"Current URL: {page.url}")
         if "challenge" in page.url:
@@ -425,6 +426,8 @@ def scrape_background(job, context):
             return
 
         page.wait_for_load_state("networkidle")
+        page.mouse.wheel(0, 1500)
+        time.sleep(3)
         human_pause(1.2, 2.7)
 
         human_scroll_and_collect(page, job)
@@ -445,6 +448,8 @@ def playwright_worker(playwright_cookies):
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--start-maximized",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
             ],
@@ -461,9 +466,12 @@ def playwright_worker(playwright_cookies):
         )
 
         context.add_cookies(playwright_cookies)
+        print("Cookies loaded into browser:", len(playwright_cookies))
 
         page = context.new_page()
         page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+        page.mouse.move(100, 200)
+        page.click("body")
         human_pause(2.5, 5.5)
         page.close()
         log("Instagram session activated")
@@ -499,7 +507,7 @@ def profile_handler(message):
     if not username:
         bot.send_message(
             message.chat.id,
-            "? Invalid input.\n\nSend:\n� Instagram username\n� Instagram profile link",
+            "? Invalid input.\n\nSend:\n• Instagram username\n• Instagram profile link",
         )
         return
 
@@ -659,3 +667,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
